@@ -1,1 +1,1708 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <algorithm>
+#include <cmath>
+#include <cctype>
+#include <cstdlib>
+#include <cstring>
 
+// ==========================================
+// 1. PIN DEFINITIONS & HARDWARE CONSTANTS
+// ==========================================
+const int ENC_L_A = 32;
+const int ENC_L_B = 33;
+const int ENC_R_A = 25;
+const int ENC_R_B = 26;
+
+const int I2C_SDA = 21;
+const int I2C_SCL = 22;
+const int MPU_ADDR = 0x68;
+
+const int MOT_L_F = 18; 
+const int MOT_L_R = 19; 
+const int MOT_R_F = 23; 
+const int MOT_R_R = 4;  
+
+// ONBOARD CONTROLS & INDICATORS
+const int BTN_PIN = 0; // ESP32 Onboard BOOT Button
+const int LED_PIN = 2; // ESP32 Onboard Blue LED
+
+// QUICK POLARITY FLIPPERS (Change to -1 if a wheel/encoder/gyro is wired backwards on Kit Day)
+const int32_t ENC_L_SIGN = 1;
+const int32_t ENC_R_SIGN = 1;
+const float MOTOR_L_SIGN = 1.0f;
+const float MOTOR_R_SIGN = 1.0f;
+const float GYRO_Z_SIGN  = 1.0f;
+
+// Left/Right wheel trim multipliers (Tune via Serial: trim <L> <R> if robot arcs slightly)
+float motor_l_trim = 1.0f;
+float motor_r_trim = 1.0f;
+
+// PHYSICAL DIMENSIONS & OPERATING BOUNDS (Verify with a ruler on Kit Day)
+const float WHEEL_RADIUS_CM = 2.25f; 
+const float WHEEL_CIRCUMFERENCE_CM = 2.0f * PI * WHEEL_RADIUS_CM;
+const float TICKS_PER_REV = 330.0f; 
+const float CM_PER_TICK = WHEEL_CIRCUMFERENCE_CM / TICKS_PER_REV;
+const float TRACK_WIDTH_CM = 15.0f;          // Center-to-center distance between left & right tires
+const float LOOKAHEAD_CM = 15.0f;            // Lookahead distance for smooth cross-track steering
+const float GYRO_FUSION_WEIGHT = 0.98f;      // 98% Gyro + 2% Wheel Encoder complementary fusion
+const float MAX_WHEEL_SPEED_CM_S = 250.0f;   // Spike filter ceiling against single-tick EMI glitches
+const float MIN_COORD_CM = -300.0f;          // Operating area minimum coordinate bound (cm)
+const float MAX_COORD_CM = 300.0f;           // Operating area maximum coordinate bound (cm)
+
+// PHYSICAL TSP ROUTE COST MODEL (Models route cost in physical travel + turn time)
+const float NOMINAL_DRIVE_SPEED_CM_S = 40.0f; // Expected average straight-line speed (cm/s)
+const float NOMINAL_TURN_RATE_RAD_S  = 5.0f;  // Expected average in-place turn rate (rad/s)
+const float TURN_SETTLE_OVERHEAD_S   = 0.15f; // Per-waypoint turn settle overhead (s)
+float turn_penalty_cm_per_rad = NOMINAL_DRIVE_SPEED_CM_S / NOMINAL_TURN_RATE_RAD_S; // 8.0 cm/rad
+
+// TIMING & TOLERANCES
+const uint32_t CONTROL_PERIOD_MS = 10;
+const uint32_t CONTROL_TIMEOUT_MS = 30000;
+const uint32_t RAMP_UP_MS = 250;
+const uint32_t START_COUNTDOWN_MS = 3000;    // 3s hands-off delay before mission starts
+const uint32_t RECOVERY_COUNTDOWN_MS = 5000; // 5s hands-off delay before recovery resumes
+const float MAX_CONTROL_DT_S = 0.1f;
+
+// Primary tight tolerances + practical stall-settle window (well inside 10cm circle / 5cm radius)
+const float HEADING_TOLERANCE_RAD = 0.03f;       // ~1.7 deg primary target tolerance
+const float HEADING_ACCEPTABLE_RAD = 0.087f;     // ~5.0 deg acceptable settle window if stalled
+const float DISTANCE_TOLERANCE_CM = 0.8f;        // 0.8 cm primary target tolerance
+const float DISTANCE_ACCEPTABLE_CM = 2.8f;       // 2.8 cm acceptable settle window (inside 5cm radius)
+const uint32_t PRIMARY_SETTLE_MS = 150;          // Required stationary hold inside tight tolerance
+const uint32_t STALL_SETTLE_MS = 600;            // Required stationary hold inside acceptable window
+const uint32_t HARD_STALL_PROTECT_MS = 2500;     // Cut power if jammed against obstacle > 2.5s
+
+// Stillness thresholds (requires continuous stillness before starting 2.5s judge dwell)
+const float STILL_SPEED_CM_S = 1.0f;
+const float STILL_GYRO_DEG_S = 2.5f;
+const uint32_t STILL_HOLD_MS = 80;
+
+// Tunable PWM Limits & Static Friction Floors (Tune on kit day or live via Serial: pwm / minpwm)
+float max_drive_pwm = 255.0f;
+float max_turn_pwm  = 225.0f;
+float min_turn_pwm  = 38.0f;
+float min_drive_pwm = 32.0f;
+
+// PID Constants (Tune on kit day or live via Serial: gaind / gainh; bounded 0..500)
+const float MAX_PID_GAIN = 500.0f;
+float Kp_dist = 15.0f, Ki_dist = 0.1f, Kd_dist = 5.0f;
+float Kp_turn = 40.0f, Ki_turn = 2.0f, Kd_turn = 10.0f;
+
+// ==========================================
+// 2. GLOBAL STATE & ODOMETRY
+// ==========================================
+volatile int32_t ticks_L = 0;
+volatile int32_t ticks_R = 0;
+portMUX_TYPE encoder_mux = portMUX_INITIALIZER_UNLOCKED;
+int32_t last_ticks_L = 0;
+int32_t last_ticks_R = 0;
+
+float x_cm = 0.0f;
+float y_cm = 0.0f;
+float theta_rad = 0.0f;
+float filtered_speed_cm_s = 0.0f;
+float latest_gyro_deg_s = 0.0f;
+float latest_turn_rate_rad_s = 0.0f;
+float last_cmd_left_pwm = 0.0f;
+float last_cmd_right_pwm = 0.0f;
+
+float gyro_z_bias = 0.0f;
+bool gyro_calibrated = false;
+uint32_t last_time_us = 0;
+uint32_t still_since_ms = 0;
+uint32_t consecutive_imu_failures = 0;
+bool imu_recovery_pending = false;
+uint32_t imu_recovery_wake_ms = 0;
+
+// Control-loop execution profiling
+uint32_t last_loop_exec_us = 0;
+uint32_t max_loop_exec_us = 0;
+
+struct Point {
+  float x;
+  float y;
+};
+
+// ==========================================
+// 3. TSP & WAYPOINT DATA
+// ==========================================
+// Enter the 5 coordinates given by the judges here (or live over Serial via: wp <1..5> <x> <y>)
+Point waypoints[5] = {
+  {50.0f, 50.0f}, 
+  {120.0f, 30.0f}, 
+  {200.0f, 180.0f}, 
+  {30.0f, 210.0f}, 
+  {100.0f, 100.0f}
+};
+
+int optimal_route[5] = {0, 1, 2, 3, 4}; 
+
+// Mission & 2-Step Recovery State Machine
+int current_target_index = 0;
+int last_dwelled_index = -1;
+uint32_t last_dwell_end_ms = 0;
+Point last_dwell_pos = {0.0f, 0.0f};
+bool in_dwell_phase = false;
+
+bool mission_started = false;
+bool mission_done = false;
+bool paused_for_recovery = false;
+int recovery_target_index = 0;
+float pending_recovery_heading_deg = 0.0f;
+uint32_t recovery_blink_start_ms = 0;
+bool abort_current_motion = false;
+bool last_btn_state = HIGH;
+
+uint32_t last_telemetry_ms = 0;
+char serial_command[64];
+size_t serial_command_length = 0;
+bool serial_command_overflow = false;
+
+// Forward Declarations
+void setMotors(float left_pwm, float right_pwm);
+bool updateOdometry();
+void printTelemetry();
+void printStatusReport();
+void printHelp();
+bool checkUserInput();
+void enterRecoveryPause(int override_route_step = -1, float custom_heading_deg = 0.0f);
+void resumeFromRecovery(int override_route_step = -1, float custom_heading_deg = NAN);
+bool turnToHeading(float target_angle_rad);
+bool driveDistance(float distance_cm, float locked_heading_override = NAN, const Point *live_target = nullptr);
+void handleSerialCommand(char *command);
+
+// ==========================================
+// 4. HARDWARE INTERRUPTS & IMU
+// ==========================================
+void IRAM_ATTR isr_left() {
+  const int32_t delta = (digitalRead(ENC_L_B) == HIGH ? 1 : -1) * ENC_L_SIGN;
+  portENTER_CRITICAL_ISR(&encoder_mux);
+  ticks_L += delta;
+  portEXIT_CRITICAL_ISR(&encoder_mux);
+}
+
+void IRAM_ATTR isr_right() {
+  const int32_t delta = (digitalRead(ENC_R_B) == LOW ? 1 : -1) * ENC_R_SIGN;
+  portENTER_CRITICAL_ISR(&encoder_mux);
+  ticks_R += delta;
+  portEXIT_CRITICAL_ISR(&encoder_mux);
+}
+
+void takeEncoderSnapshot(int32_t &out_L, int32_t &out_R) {
+  portENTER_CRITICAL(&encoder_mux);
+  out_L = ticks_L;
+  out_R = ticks_R;
+  portEXIT_CRITICAL(&encoder_mux);
+}
+
+void syncOdometryTrackers(bool zero_hardware_ticks = false) {
+  portENTER_CRITICAL(&encoder_mux);
+  if (zero_hardware_ticks) {
+    ticks_L = 0;
+    ticks_R = 0;
+  }
+  last_ticks_L = ticks_L;
+  last_ticks_R = ticks_R;
+  portEXIT_CRITICAL(&encoder_mux);
+  filtered_speed_cm_s = 0.0f;
+  latest_gyro_deg_s = 0.0f;
+  latest_turn_rate_rad_s = 0.0f;
+  still_since_ms = millis();
+  last_time_us = micros();
+}
+
+bool writeIMURegister(uint8_t reg, uint8_t value) {
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(reg);
+  Wire.write(value);
+  return Wire.endTransmission(true) == 0;
+}
+
+bool readIMURegister(uint8_t reg, uint8_t &value) {
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(reg);
+  if (Wire.endTransmission(false) != 0 || Wire.requestFrom(MPU_ADDR, 1, true) != 1) return false;
+  const int b = Wire.read();
+  if (b < 0) return false;
+  value = static_cast<uint8_t>(b);
+  return true;
+}
+
+bool configureIMURegisters() {
+  // 0x1A = 0x03 (42Hz Hardware DLPF), 0x19 = 0x09 (100Hz Sample Rate), 0x1B = 0x08 (+/-500 deg/s)
+  return writeIMURegister(0x1A, 0x03) &&
+         writeIMURegister(0x19, 0x09) &&
+         writeIMURegister(0x1B, 0x08);
+}
+
+bool setupIMU() {
+  if (!Wire.begin(I2C_SDA, I2C_SCL)) return false;
+  Wire.setClock(400000);
+  Wire.setTimeOut(4); // Short 4ms timeout prevents I2C bus glitches from stalling PID loop
+
+  uint8_t who_am_i = 0;
+  if (!readIMURegister(0x75, who_am_i) || ((who_am_i & 0x7E) != 0x68 && who_am_i != 0x70)) {
+    return false;
+  }
+
+  // 0x6B = 0x01 (Wake up + lock clock to X-axis gyro PLL for thermal stability)
+  if (!writeIMURegister(0x6B, 0x01)) return false;
+  delay(50);
+  imu_recovery_pending = false;
+  return configureIMURegisters();
+}
+
+bool readGyroRaw(int16_t &raw_z) {
+  for (int attempt = 0; attempt < 2; ++attempt) {
+    Wire.beginTransmission(MPU_ADDR);
+    Wire.write(0x47);
+    if (Wire.endTransmission(false) == 0 && Wire.requestFrom(MPU_ADDR, 2, true) == 2) {
+      const int high_byte = Wire.read();
+      const int low_byte = Wire.read();
+      if (high_byte >= 0 && low_byte >= 0) {
+        const uint16_t combined = (static_cast<uint16_t>(high_byte) << 8) | static_cast<uint16_t>(low_byte);
+        const int16_t val = static_cast<int16_t>(combined);
+        // Reject saturated / all-1s corrupted I2C reads so encoder fallback handles the tick
+        if (val >= 32700 || val <= -32700) return false;
+        raw_z = val;
+        return true;
+      }
+    }
+    delayMicroseconds(30);
+  }
+  return false;
+}
+
+// Strict stationary gyro calibration (returns false if robot moved or noise remained high)
+bool calibrateGyro(uint16_t samples = 500, uint16_t settle_ms = 500) {
+  gyro_calibrated = false;
+  if (settle_ms > 0) delay(settle_ms);
+
+  for (int cal_attempt = 0; cal_attempt < 5; ++cal_attempt) {
+    int32_t start_L, start_R;
+    takeEncoderSnapshot(start_L, start_R);
+
+    double sum = 0.0;
+    double sum_sq = 0.0;
+    bool read_ok = true;
+    for (uint16_t i = 0; i < samples; i++) {
+      int16_t raw_z;
+      if (!readGyroRaw(raw_z)) {
+        read_ok = false;
+        break;
+      }
+      const double deg_s = (static_cast<double>(raw_z) / 65.5) * static_cast<double>(GYRO_Z_SIGN);
+      sum += deg_s;
+      sum_sq += deg_s * deg_s;
+      if (i % 40 == 0) digitalWrite(LED_PIN, !digitalRead(LED_PIN));
+      delay(2);
+    }
+    digitalWrite(LED_PIN, LOW);
+
+    if (!read_ok) {
+      Serial.println("[CAL WARNING]: I2C read failed during calibration; retrying...");
+      delay(250);
+      continue;
+    }
+
+    int32_t end_L, end_R;
+    takeEncoderSnapshot(end_L, end_R);
+
+    const double mean = sum / static_cast<double>(samples);
+    const double variance = fmax(0.0, (sum_sq / static_cast<double>(samples)) - (mean * mean));
+    const double sd = sqrt(variance);
+
+    // Require strict stillness (<= 1 tick movement) and low gyro noise (< 1.2 deg/s SD)
+    if (abs(end_L - start_L) <= 1 && abs(end_R - start_R) <= 1 && sd < 1.2 && fabs(mean) < 25.0) {
+      gyro_z_bias = static_cast<float>(mean);
+      gyro_calibrated = true;
+      Serial.print("[CAL OK]: Gyro Bias = ");
+      Serial.print(gyro_z_bias, 3);
+      Serial.print(" deg/s | Noise SD = ");
+      Serial.print(sd, 3);
+      Serial.println(" deg/s");
+      return true;
+    }
+
+    Serial.println("[CAL RETRY]: Chassis movement or noise detected; keep robot completely still...");
+    delay(300);
+  }
+
+  Serial.println("[CAL FAILED]: Could not obtain a stationary low-noise calibration window.");
+  return false;
+}
+
+bool readGyroZ(float &gyro_z) {
+  int16_t raw_z;
+  if (!readGyroRaw(raw_z)) return false;
+  gyro_z = (static_cast<float>(raw_z) / 65.5f) * GYRO_Z_SIGN - gyro_z_bias;
+  return true;
+}
+
+float normalizeAngle(float angle_rad) {
+  return atan2f(sinf(angle_rad), cosf(angle_rad));
+}
+
+// Continuous sliding-window stillness check (min_quiet_ms = 0 checks instantaneous low speed & gyro rate)
+bool isChassisStationary(uint32_t min_quiet_ms = STILL_HOLD_MS) {
+  if (still_since_ms == 0) return false;
+  if (min_quiet_ms == 0) return true;
+  return static_cast<uint32_t>(millis() - still_since_ms) >= min_quiet_ms;
+}
+
+bool updateOdometry() {
+  const uint32_t prof_start_us = micros();
+  int32_t current_ticks_L, current_ticks_R;
+  takeEncoderSnapshot(current_ticks_L, current_ticks_R);
+
+  const uint32_t now_us = micros();
+  const uint32_t elapsed_us = now_us - last_time_us;
+  if (elapsed_us == 0) return true;
+  last_time_us = now_us;
+
+  // Use actual elapsed time for all rate calculations to prevent spikes after delayed iterations
+  const float raw_dt_s = elapsed_us / 1000000.0f;
+  const float actual_dt_s = fmaxf(raw_dt_s, 0.0005f);
+  const bool dt_overrun = (raw_dt_s > MAX_CONTROL_DT_S);
+
+  const int32_t delta_ticks_L = current_ticks_L - last_ticks_L;
+  const int32_t delta_ticks_R = current_ticks_R - last_ticks_R;
+  last_ticks_L = current_ticks_L;
+  last_ticks_R = current_ticks_R;
+
+  // Clamp single-tick displacement to physically plausible ceiling over actual_dt_s
+  const float max_step_cm = MAX_WHEEL_SPEED_CM_S * actual_dt_s;
+  const float distance_L = constrain(delta_ticks_L * CM_PER_TICK, -max_step_cm, max_step_cm);
+  const float distance_R = constrain(delta_ticks_R * CM_PER_TICK, -max_step_cm, max_step_cm);
+  const float distance_cm = (distance_L + distance_R) * 0.5f;
+  const float encoder_delta_heading = (distance_R - distance_L) / TRACK_WIDTH_CM;
+
+  // Low-pass filtered linear speed using actual elapsed time
+  const float instant_speed_cm_s = distance_cm / actual_dt_s;
+  filtered_speed_cm_s += 0.25f * (instant_speed_cm_s - filtered_speed_cm_s);
+
+  // Non-blocking 2-step IMU recovery completion check (0ms blocking delay)
+  if (imu_recovery_pending && static_cast<uint32_t>(millis() - imu_recovery_wake_ms) >= 50) {
+    configureIMURegisters();
+    imu_recovery_pending = false;
+  }
+
+  float gyro_z_deg_s = 0.0f;
+  float delta_heading = 0.0f;
+  if (!imu_recovery_pending && readGyroZ(gyro_z_deg_s)) {
+    consecutive_imu_failures = 0;
+    latest_gyro_deg_s = gyro_z_deg_s;
+    if (!dt_overrun) {
+      const float gyro_delta_heading = gyro_z_deg_s * DEG_TO_RAD * actual_dt_s;
+      delta_heading = GYRO_FUSION_WEIGHT * gyro_delta_heading +
+                      (1.0f - GYRO_FUSION_WEIGHT) * encoder_delta_heading;
+      latest_turn_rate_rad_s = delta_heading / actual_dt_s;
+    } else {
+      // If loop was delayed > 100ms, integrate displacement from encoders and use live gyro for instantaneous rate
+      delta_heading = encoder_delta_heading;
+      latest_turn_rate_rad_s = gyro_z_deg_s * DEG_TO_RAD;
+    }
+  } else {
+    // 100% Differential-drive wheel encoder fallback if I2C experiences motor EMI glitch
+    consecutive_imu_failures++;
+    if (consecutive_imu_failures % 50 == 0 && !imu_recovery_pending) {
+      // Step 1 of non-blocking IMU recovery: send wake/PLL command and wait 50ms across normal ticks
+      if (writeIMURegister(0x6B, 0x01)) {
+        imu_recovery_wake_ms = millis();
+        imu_recovery_pending = true;
+      }
+    }
+    delta_heading = encoder_delta_heading;
+    latest_turn_rate_rad_s = delta_heading / actual_dt_s;
+    latest_gyro_deg_s = latest_turn_rate_rad_s * RAD_TO_DEG;
+  }
+
+  // Update continuous stillness window tracker
+  if (fabsf(filtered_speed_cm_s) < STILL_SPEED_CM_S && fabsf(latest_gyro_deg_s) < STILL_GYRO_DEG_S) {
+    if (still_since_ms == 0) still_since_ms = millis();
+  } else {
+    still_since_ms = 0;
+  }
+
+  const float midpoint_heading = theta_rad + delta_heading * 0.5f;
+  x_cm += distance_cm * cosf(midpoint_heading);
+  y_cm += distance_cm * sinf(midpoint_heading);
+  theta_rad = normalizeAngle(theta_rad + delta_heading);
+
+  last_loop_exec_us = micros() - prof_start_us;
+  if (last_loop_exec_us > max_loop_exec_us) max_loop_exec_us = last_loop_exec_us;
+  return true;
+}
+
+// ==========================================
+// 5. TURN-AWARE TSP SOLVER (PHYSICAL TIME/COST MODEL)
+// ==========================================
+float getDistance(Point a, Point b) {
+  return hypotf(a.x - b.x, a.y - b.y);
+}
+
+bool calculateOptimalRoute() {
+  Serial.println("Calculating Turn-Aware TSP route...");
+
+  for (int i = 0; i < 5; ++i) {
+    if (!isfinite(waypoints[i].x) || !isfinite(waypoints[i].y) ||
+        waypoints[i].x < MIN_COORD_CM || waypoints[i].x > MAX_COORD_CM ||
+        waypoints[i].y < MIN_COORD_CM || waypoints[i].y > MAX_COORD_CM) {
+      Serial.println("[ROUTE ERROR]: Waypoint coordinates must be finite and within [-300, 300] cm.");
+      return false;
+    }
+  }
+  
+  int current_route[5] = {0, 1, 2, 3, 4}; 
+  int best_route[5] = {0, 1, 2, 3, 4};
+  float shortest_cost_cm = INFINITY;
+  float best_est_time_s = INFINITY;
+  Point origin = {0.0f, 0.0f};
+
+  do {
+    float route_cost_cm = 0.0f;
+    float route_time_s = 0.0f;
+    Point current_pos = origin;
+    float simulated_heading = 0.0f; 
+
+    for (int i = 0; i < 5; i++) {
+      const float dx = waypoints[current_route[i]].x - current_pos.x;
+      const float dy = waypoints[current_route[i]].y - current_pos.y;
+      const float dist = hypotf(dx, dy);
+      const float target_heading = atan2f(dy, dx);
+      const float turn_amount = fabsf(normalizeAngle(target_heading - simulated_heading));
+      
+      route_cost_cm += dist + (turn_amount * turn_penalty_cm_per_rad);
+      route_time_s  += (dist / NOMINAL_DRIVE_SPEED_CM_S) +
+                       (turn_amount / NOMINAL_TURN_RATE_RAD_S) +
+                       TURN_SETTLE_OVERHEAD_S;
+      
+      current_pos = waypoints[current_route[i]];
+      simulated_heading = target_heading;
+    }
+    
+    const float dx_home = origin.x - current_pos.x;
+    const float dy_home = origin.y - current_pos.y;
+    const float dist_home = hypotf(dx_home, dy_home);
+    const float target_heading_home = atan2f(dy_home, dx_home);
+    const float turn_amount_home = fabsf(normalizeAngle(target_heading_home - simulated_heading));
+
+    route_cost_cm += dist_home + (turn_amount_home * turn_penalty_cm_per_rad);
+    route_time_s  += (dist_home / NOMINAL_DRIVE_SPEED_CM_S) +
+                     (turn_amount_home / NOMINAL_TURN_RATE_RAD_S) +
+                     TURN_SETTLE_OVERHEAD_S;
+
+    if (isfinite(route_cost_cm) && route_cost_cm < shortest_cost_cm) {
+      shortest_cost_cm = route_cost_cm;
+      best_est_time_s = route_time_s;
+      for (int i = 0; i < 5; i++) best_route[i] = current_route[i];
+    }
+  } while (std::next_permutation(current_route, current_route + 5));
+
+  if (!isfinite(shortest_cost_cm)) {
+    Serial.println("[ROUTE ERROR]: No finite route could be calculated.");
+    return false;
+  }
+
+  for (int i = 0; i < 5; i++) optimal_route[i] = best_route[i];
+
+  Serial.print("Optimal Route Found! Cost: ");
+  Serial.print(shortest_cost_cm, 1);
+  Serial.print(" cm (Est. Motion Time: ");
+  Serial.print(best_est_time_s, 1);
+  Serial.print(" s) | Order: ");
+  for (int i = 0; i < 5; i++) {
+    Serial.print("P");
+    Serial.print(optimal_route[i] + 1);
+    Serial.print("[id=");
+    Serial.print(optimal_route[i]);
+    Serial.print("] -> ");
+  }
+  Serial.println("HOME");
+  return true;
+}
+
+// ==========================================
+// 6. MOTOR HARDWARE CONTROL
+// ==========================================
+void setupMotors() {
+  pinMode(MOT_L_F, OUTPUT); pinMode(MOT_L_R, OUTPUT);
+  pinMode(MOT_R_F, OUTPUT); pinMode(MOT_R_R, OUTPUT);
+  
+  analogWrite(MOT_L_F, 0); analogWrite(MOT_L_R, 0);
+  analogWrite(MOT_R_F, 0); analogWrite(MOT_R_R, 0);
+}
+
+// Only boosts PWM above static friction when pushing in the direction of the error (prevents D-term braking chatter)
+float applyDeadbandWithDirection(float pwm, float error, float min_pwm) {
+  if (pwm == 0.0f || min_pwm <= 0.0f) return pwm;
+  if ((pwm > 0.0f && error > 0.0f) || (pwm < 0.0f && error < 0.0f)) {
+    if (fabsf(pwm) < min_pwm) {
+      return (pwm > 0.0f) ? min_pwm : -min_pwm;
+    }
+  }
+  return pwm;
+}
+
+void limitMotorPair(float &left_pwm, float &right_pwm, float max_magnitude) {
+  const float largest_magnitude = fmaxf(fabsf(left_pwm), fabsf(right_pwm));
+  if (largest_magnitude > max_magnitude && largest_magnitude > 0.0f) {
+    const float scale = max_magnitude / largest_magnitude;
+    left_pwm *= scale;
+    right_pwm *= scale;
+  }
+}
+
+void setMotors(float left_pwm, float right_pwm) {
+  if (!isfinite(left_pwm)) left_pwm = 0.0f;
+  if (!isfinite(right_pwm)) right_pwm = 0.0f;
+
+  // Instant stop if 0,0 is requested; otherwise apply gentle slew limit (max 65 PWM/tick) to protect N20 gears
+  if (left_pwm == 0.0f && right_pwm == 0.0f) {
+    last_cmd_left_pwm = 0.0f;
+    last_cmd_right_pwm = 0.0f;
+  } else {
+    const float max_step = 65.0f;
+    left_pwm  = constrain(left_pwm,  last_cmd_left_pwm  - max_step, last_cmd_left_pwm  + max_step);
+    right_pwm = constrain(right_pwm, last_cmd_right_pwm - max_step, last_cmd_right_pwm + max_step);
+    last_cmd_left_pwm = left_pwm;
+    last_cmd_right_pwm = right_pwm;
+  }
+
+  left_pwm  = constrain(left_pwm  * motor_l_trim * MOTOR_L_SIGN, -255.0f, 255.0f);
+  right_pwm = constrain(right_pwm * motor_r_trim * MOTOR_R_SIGN, -255.0f, 255.0f);
+  const int left_output = static_cast<int>(lroundf(left_pwm));
+  const int right_output = static_cast<int>(lroundf(right_pwm));
+
+  // Clear inactive H-bridge direction FIRST to prevent simultaneous non-zero shoot-through
+  if (left_output >= 0) {
+    analogWrite(MOT_L_R, 0);
+    analogWrite(MOT_L_F, left_output);
+  } else {
+    analogWrite(MOT_L_F, 0);
+    analogWrite(MOT_L_R, -left_output);
+  }
+
+  if (right_output >= 0) {
+    analogWrite(MOT_R_R, 0);
+    analogWrite(MOT_R_F, right_output);
+  } else {
+    analogWrite(MOT_R_F, 0);
+    analogWrite(MOT_R_R, -right_output);
+  }
+}
+
+// ==========================================
+// 7. TELEMETRY & MISSION STATE ACTIONS
+// ==========================================
+void printTelemetry() {
+  const uint32_t now = millis();
+  if (now - last_telemetry_ms >= 100) { 
+    last_telemetry_ms = now;
+    // Non-blocking check so Serial output never stalls the 100Hz PID control loop
+    if (Serial.availableForWrite() < 64) return;
+
+    int32_t current_ticks_L, current_ticks_R;
+    takeEncoderSnapshot(current_ticks_L, current_ticks_R);
+    
+    Serial.print(now / 1000.0f, 2); Serial.print(",");
+    Serial.print(x_cm, 2); Serial.print(",");
+    Serial.print(y_cm, 2); Serial.print(",");
+    Serial.print(theta_rad * 180.0f / PI, 2); Serial.print(",");
+    Serial.print(current_ticks_L); Serial.print(",");
+    Serial.println(current_ticks_R);
+  }
+}
+
+void printStatusReport() {
+  int32_t l, r;
+  takeEncoderSnapshot(l, r);
+  Serial.println("\n================ ROBOT STATUS ================");
+  Serial.print("Pose (X, Y, Yaw): (");
+  Serial.print(x_cm, 2); Serial.print(" cm, ");
+  Serial.print(y_cm, 2); Serial.print(" cm, ");
+  Serial.print(theta_rad * RAD_TO_DEG, 2); Serial.println(" deg)");
+  Serial.print("Encoders (L, R):  ");
+  Serial.print(l); Serial.print(", "); Serial.println(r);
+  Serial.print("Speed / GyroZ:    ");
+  Serial.print(filtered_speed_cm_s, 2); Serial.print(" cm/s, ");
+  Serial.print(latest_gyro_deg_s, 2); Serial.print(" deg/s | Calibrated: ");
+  Serial.println(gyro_calibrated ? "YES" : "NO");
+  Serial.print("DIST PID (Kp,Ki,Kd): ");
+  Serial.print(Kp_dist, 2); Serial.print(", ");
+  Serial.print(Ki_dist, 2); Serial.print(", ");
+  Serial.println(Kd_dist, 2);
+  Serial.print("TURN PID (Kp,Ki,Kd): ");
+  Serial.print(Kp_turn, 2); Serial.print(", ");
+  Serial.print(Ki_turn, 2); Serial.print(", ");
+  Serial.println(Kd_turn, 2);
+  Serial.print("PWM Max (Drive/Turn): ");
+  Serial.print(max_drive_pwm, 0); Serial.print(" / ");
+  Serial.print(max_turn_pwm, 0);
+  Serial.print(" | Min Deadband (Drive/Turn): ");
+  Serial.print(min_drive_pwm, 0); Serial.print(" / ");
+  Serial.println(min_turn_pwm, 0);
+  Serial.print("Wheel Trim (L/R): ");
+  Serial.print(motor_l_trim, 3); Serial.print(" / ");
+  Serial.print(motor_r_trim, 3);
+  Serial.print(" | Odom Exec (Last/Max): ");
+  Serial.print(last_loop_exec_us); Serial.print(" / ");
+  Serial.print(max_loop_exec_us); Serial.println(" us");
+  Serial.println("==============================================");
+}
+
+void printHelp() {
+  Serial.println("\n================ SERIAL COMMANDS ================");
+  Serial.println("  s / run / start          : 3s countdown, zero pose, start mission");
+  Serial.println("  x / stop / pause         : Instant stop & enter recovery pause");
+  Serial.println("  r [leg 1..6] [hdg_deg]   : Pause OR start 5s recovery countdown");
+  Serial.println("  wp <1..5> <x_cm> <y_cm>  : Transactional waypoint update & TSP plan");
+  Serial.println("  plan                     : Recalculate & print optimal TSP route");
+  Serial.println("  turn <deg> / rotate <deg>: Standalone turn test (zeros pose / relative)");
+  Serial.println("  drive <cm>               : Standalone straight-line PID test");
+  Serial.println("  gaind <kp> <ki> <kd>     : Update distance PID gains (0..500)");
+  Serial.println("  gainh <kp> <ki> <kd>     : Update heading PID gains (0..500)");
+  Serial.println("  pwm <drive_max> <turn>   : Update max PWM limits (min_pwm..255)");
+  Serial.println("  minpwm <drive> <turn>    : Update min friction PWM (0..max_pwm)");
+  Serial.println("  trim <left> <right>      : Update wheel trim multipliers (0.5..1.5)");
+  Serial.println("  cal / zero / status      : Recalibrate gyro / zero pose / print status");
+  Serial.println("=================================================");
+}
+
+// Non-blocking countdown with LED blinking (cancellable via Serial 'x' OR physical BOOT button)
+bool runHandsOffCountdown(uint32_t duration_ms, const char *label) {
+  setMotors(0, 0);
+  Serial.print("\n[COUNTDOWN]: ");
+  Serial.print(label);
+  Serial.print(" in ");
+  Serial.print(duration_ms / 1000);
+  Serial.println(" seconds (Hands off! Tap BOOT or 'x' to cancel)...");
+
+  const uint32_t start_ms = millis();
+  uint32_t last_blink_ms = start_ms;
+  bool led_state = true;
+  bool button_released_since_start = false;
+  digitalWrite(LED_PIN, HIGH);
+
+  while (static_cast<uint32_t>(millis() - start_ms) < duration_ms) {
+    const uint32_t elapsed_ms = static_cast<uint32_t>(millis() - start_ms);
+    if (elapsed_ms > 350) {
+      if (digitalRead(BTN_PIN) == HIGH) {
+        button_released_since_start = true;
+      } else if (button_released_since_start && digitalRead(BTN_PIN) == LOW) {
+        digitalWrite(LED_PIN, LOW);
+        while (digitalRead(BTN_PIN) == LOW) delay(10);
+        last_btn_state = HIGH;
+        Serial.println("\n[COUNTDOWN CANCELLED BY BUTTON]");
+        return false;
+      }
+    }
+
+    if (Serial.available() > 0) {
+      const char c = static_cast<char>(Serial.peek());
+      if (c == 'x' || c == 'X') {
+        Serial.read();
+        digitalWrite(LED_PIN, LOW);
+        last_btn_state = digitalRead(BTN_PIN);
+        Serial.println("\n[COUNTDOWN CANCELLED]");
+        return false;
+      }
+    }
+
+    const uint32_t now_ms = millis();
+    if (now_ms - last_blink_ms >= 250) {
+      last_blink_ms = now_ms;
+      led_state = !led_state;
+      digitalWrite(LED_PIN, led_state ? HIGH : LOW);
+    }
+    delay(10);
+  }
+  digitalWrite(LED_PIN, LOW);
+  last_btn_state = digitalRead(BTN_PIN);
+  return true;
+}
+
+// Determines which waypoint was actually missed (solves post-2.5s dwell increment & final-leg recovery)
+int detectMissedWaypointIndex() {
+  if (in_dwell_phase) {
+    return constrain(current_target_index, 0, 5);
+  }
+  if (last_dwelled_index >= 0 && last_dwelled_index <= 5) {
+    const uint32_t since_dwell_ms = static_cast<uint32_t>(millis() - last_dwell_end_ms);
+    const float dist_from_last_dwell = hypotf(x_cm - last_dwell_pos.x, y_cm - last_dwell_pos.y);
+    // If stopped within 8s and <25cm of leaving the previous dwell, user is reacting to that missed waypoint
+    if (since_dwell_ms < 8000 && dist_from_last_dwell < 25.0f) {
+      return last_dwelled_index;
+    }
+  }
+  return constrain(current_target_index, 0, 5);
+}
+
+void triggerMissionStart() {
+  if (mission_started && !mission_done && !paused_for_recovery) {
+    Serial.println("\n[COMMAND IGNORED]: Mission is already active.");
+    return;
+  }
+  if (!gyro_calibrated) {
+    Serial.println("\n[WARNING]: Gyro was not cleanly calibrated. Running calibration now...");
+    if (!calibrateGyro()) {
+      Serial.println("[START ABORTED]: Keep robot stationary and run 'cal' before starting.");
+      return;
+    }
+  }
+
+  if (!runHandsOffCountdown(START_COUNTDOWN_MS, "Starting Mission from Origin (0,0,0)")) {
+    return;
+  }
+
+  // Wipe any pose drift from handling the robot prior to start
+  x_cm = 0.0f;
+  y_cm = 0.0f;
+  theta_rad = 0.0f;
+  current_target_index = 0;
+  last_dwelled_index = -1;
+  in_dwell_phase = false;
+  mission_started = true;
+  mission_done = false;
+  paused_for_recovery = false;
+  pending_recovery_heading_deg = 0.0f;
+  abort_current_motion = false;
+  syncOdometryTrackers(true);
+  Serial.println("\n[MISSION STARTED]: Pose zeroed to (0.0, 0.0, 0.0 deg).");
+}
+
+// Step 1 of Recovery: Freezes motors, preserves leg & heading arguments, and waits for human placement
+void enterRecoveryPause(int override_route_step, float custom_heading_deg) {
+  setMotors(0, 0);
+  digitalWrite(LED_PIN, LOW);
+  abort_current_motion = true;
+  paused_for_recovery = true;
+  recovery_blink_start_ms = millis();
+
+  if (override_route_step >= 0 && override_route_step <= 5) {
+    recovery_target_index = override_route_step;
+  } else {
+    recovery_target_index = detectMissedWaypointIndex();
+  }
+  pending_recovery_heading_deg = isfinite(custom_heading_deg) ? custom_heading_deg : 0.0f;
+
+  Serial.println("\n=======================================================");
+  Serial.println("[PAUSED FOR RECOVERY / STOP]: Motors locked OFF.");
+  if (recovery_target_index < 5) {
+    const Point wp = waypoints[optimal_route[recovery_target_index]];
+    Serial.print("Target to Recover: Route Leg ");
+    Serial.print(recovery_target_index + 1);
+    Serial.print("/5 (Waypoint P");
+    Serial.print(optimal_route[recovery_target_index] + 1);
+    Serial.print(" at X=");
+    Serial.print(wp.x, 1);
+    Serial.print(", Y=");
+    Serial.print(wp.y, 1);
+    Serial.print(") | Saved Heading = ");
+    Serial.print(pending_recovery_heading_deg, 1);
+    Serial.println(" deg");
+  } else {
+    Serial.print("Target to Recover: HOME (0, 0) | Saved Heading = ");
+    Serial.print(pending_recovery_heading_deg, 1);
+    Serial.println(" deg");
+  }
+  Serial.println("1. Pick up robot & place on missed waypoint at saved heading.");
+  Serial.println("2. Short-tap BOOT button (or send 'r') for 5s resume countdown.");
+  Serial.println("   (Optional: Hold BOOT >= 0.8s while paused to cycle target leg).");
+  Serial.println("=======================================================");
+}
+
+// Step 2 of Recovery: 5s hands-off countdown, applies preserved or overridden leg/heading, and resumes
+void resumeFromRecovery(int override_route_step, float custom_heading_deg) {
+  setMotors(0, 0);
+  if (override_route_step >= 0 && override_route_step <= 5) {
+    recovery_target_index = override_route_step;
+  }
+  if (isfinite(custom_heading_deg)) {
+    pending_recovery_heading_deg = custom_heading_deg;
+  }
+
+  if (!runHandsOffCountdown(RECOVERY_COUNTDOWN_MS, "Resuming from Missed Waypoint")) {
+    return;
+  }
+
+  const Point missed = (recovery_target_index < 5)
+      ? waypoints[optimal_route[recovery_target_index]]
+      : Point{0.0f, 0.0f};
+
+  x_cm = missed.x;
+  y_cm = missed.y;
+  theta_rad = normalizeAngle(pending_recovery_heading_deg * DEG_TO_RAD);
+  syncOdometryTrackers(false);
+
+  last_dwelled_index = recovery_target_index;
+  last_dwell_end_ms = millis();
+  last_dwell_pos = missed;
+  current_target_index = recovery_target_index + 1;
+  paused_for_recovery = false;
+  pending_recovery_heading_deg = 0.0f;
+  abort_current_motion = false;
+  mission_started = true;
+
+  Serial.print("\n[RECOVERY COMPLETE]: Snapped to (");
+  Serial.print(x_cm, 1);
+  Serial.print(", ");
+  Serial.print(y_cm, 1);
+  Serial.print("), Heading = ");
+  Serial.print(theta_rad * RAD_TO_DEG, 1);
+  Serial.println(" deg.");
+
+  if (current_target_index > 5) {
+    mission_done = true;
+    setMotors(0, 0);
+    Serial.println("[MISSION COMPLETE]: All targets and Home base secured!");
+  } else {
+    mission_done = false;
+  }
+}
+
+// ==========================================
+// 8. PID CONTROL LOOPS
+// ==========================================
+bool turnToHeading(float target_angle_rad) {
+  if (!isfinite(target_angle_rad)) { setMotors(0, 0); return false; }
+
+  target_angle_rad = normalizeAngle(target_angle_rad);
+  float previous_error = normalizeAngle(target_angle_rad - theta_rad);
+  float integral = 0.0f;
+
+  const uint32_t start_time_ms = millis();
+  uint32_t previous_time_us = micros() - (CONTROL_PERIOD_MS * 1000UL);
+  uint32_t settled_since_ms = 0;
+  uint32_t stall_since_ms = 0;
+  uint32_t hard_stall_since_ms = 0;
+  float stall_anchor_heading = theta_rad;
+
+  while (static_cast<uint32_t>(millis() - start_time_ms) < CONTROL_TIMEOUT_MS) {
+    if (checkUserInput()) { setMotors(0, 0); return false; }
+    updateOdometry();
+    printTelemetry(); 
+
+    const uint32_t now_us = micros();
+    const uint32_t elapsed_us = now_us - previous_time_us;
+    if (elapsed_us == 0) { delay(1); continue; }
+    // Controller time step clamped separately from odometry rate time step
+    const float dt_s = fminf(fmaxf(elapsed_us / 1000000.0f, 0.001f), MAX_CONTROL_DT_S);
+    previous_time_us = now_us;
+    const uint32_t now_ms = millis();
+
+    const float error = normalizeAngle(target_angle_rad - theta_rad);
+
+    // 1. Primary tight settle check (1.7 deg AND stationary throughout 150ms window)
+    if (fabsf(error) <= HEADING_TOLERANCE_RAD) {
+      setMotors(0, 0);
+      if (isChassisStationary(0)) {
+        if (settled_since_ms == 0) settled_since_ms = now_ms;
+        if (static_cast<uint32_t>(now_ms - settled_since_ms) >= PRIMARY_SETTLE_MS) return true;
+      } else {
+        settled_since_ms = 0;
+      }
+      delay(CONTROL_PERIOD_MS);
+      continue;
+    }
+    settled_since_ms = 0;
+
+    // 2. Practical stall-settle check (within 5 deg AND stationary throughout 600ms window)
+    if (fabsf(error) <= HEADING_ACCEPTABLE_RAD && isChassisStationary(0)) {
+      if (fabsf(normalizeAngle(theta_rad - stall_anchor_heading)) > 0.006f) {
+        stall_anchor_heading = theta_rad;
+        stall_since_ms = now_ms;
+      } else if (stall_since_ms == 0) {
+        stall_since_ms = now_ms;
+      } else if (static_cast<uint32_t>(now_ms - stall_since_ms) >= STALL_SETTLE_MS) {
+        setMotors(0, 0);
+        return true;
+      }
+    } else {
+      stall_since_ms = 0;
+      stall_anchor_heading = theta_rad;
+    }
+
+    // Zero-crossing anti-windup reset
+    if ((error > 0.0f && previous_error < 0.0f) || (error < 0.0f && previous_error > 0.0f)) {
+      integral = 0.0f;
+    }
+    previous_error = error;
+
+    integral = constrain(integral + error * dt_s, -5.0f, 5.0f);
+    const float derivative = -latest_turn_rate_rad_s;
+    float turn_power = Kp_turn * error + Ki_turn * integral + Kd_turn * derivative;
+    turn_power = applyDeadbandWithDirection(turn_power, error, min_turn_pwm);
+
+    // Soft-start ramp bounded by active_max so configured PWM ceiling is never exceeded
+    const uint32_t elapsed_ms = static_cast<uint32_t>(now_ms - start_time_ms);
+    const float active_max = fminf(255.0f, max_turn_pwm);
+    const float ramp_start = fminf(80.0f, active_max);
+    const float ramp_limit = (elapsed_ms < RAMP_UP_MS)
+        ? (ramp_start + ((active_max - ramp_start) * static_cast<float>(elapsed_ms)) / static_cast<float>(RAMP_UP_MS))
+        : active_max;
+    turn_power = constrain(turn_power, -ramp_limit, ramp_limit);
+
+    // 3. Hardware burnout protection if physically jammed for > 2.5s
+    if (fabsf(turn_power) > 80.0f && isChassisStationary(40)) {
+      if (hard_stall_since_ms == 0) hard_stall_since_ms = now_ms;
+      else if (static_cast<uint32_t>(now_ms - hard_stall_since_ms) >= HARD_STALL_PROTECT_MS) {
+        setMotors(0, 0);
+        if (fabsf(error) <= 0.15f) return true; // Within ~8.5 deg: proceed to drive (which will home in)
+        Serial.println("\n[STALL PROTECTION]: Chassis jammed during turn. Pausing to protect motors.");
+        if (mission_started && !mission_done) enterRecoveryPause();
+        return false;
+      }
+    } else {
+      hard_stall_since_ms = 0;
+    }
+
+    setMotors(-turn_power, turn_power);
+    delay(CONTROL_PERIOD_MS);
+  }
+
+  setMotors(0, 0);
+  Serial.println("\n[TIMEOUT FAULT]: Turn failed to reach target heading within 30s.");
+  if (mission_started && !mission_done) enterRecoveryPause();
+  return false;
+}
+
+bool driveDistance(float distance_cm, float locked_heading_override, const Point *live_target) {
+  if (!isfinite(distance_cm)) { setMotors(0, 0); return false; }
+  if (fabsf(distance_cm) <= DISTANCE_TOLERANCE_CM) { setMotors(0, 0); return true; }
+
+  const float start_x = x_cm;
+  const float start_y = y_cm;
+  float segment_heading = isfinite(locked_heading_override)
+      ? normalizeAngle(locked_heading_override)
+      : theta_rad;
+  float previous_error = distance_cm;
+  float integral = 0.0f;
+  int realign_count = 0;
+
+  const uint32_t start_time_ms = millis();
+  uint32_t previous_time_us = micros() - (CONTROL_PERIOD_MS * 1000UL);
+  uint32_t settled_since_ms = 0;
+  uint32_t stall_since_ms = 0;
+  uint32_t hard_stall_since_ms = 0;
+  float stall_anchor_dist = distance_cm;
+
+  while (static_cast<uint32_t>(millis() - start_time_ms) < CONTROL_TIMEOUT_MS) {
+    if (checkUserInput()) { setMotors(0, 0); return false; }
+    updateOdometry();
+    printTelemetry(); 
+
+    const uint32_t now_us = micros();
+    const uint32_t elapsed_us = now_us - previous_time_us;
+    if (elapsed_us == 0) { delay(1); continue; }
+    // Controller time step clamped separately from odometry rate time step
+    const float dt_s = fminf(fmaxf(elapsed_us / 1000000.0f, 0.001f), MAX_CONTROL_DT_S);
+    previous_time_us = now_us;
+    const uint32_t now_ms = millis();
+
+    const float traveled = (x_cm - start_x) * cosf(segment_heading) + (y_cm - start_y) * sinf(segment_heading);
+    const float derivative = -filtered_speed_cm_s;
+
+    float error = distance_cm - traveled;
+    float heading_error = normalizeAngle(segment_heading - theta_rad);
+    float check_dist = fabsf(error);
+
+    // Fixed-segment along/cross-track lookahead steering
+    if (live_target != nullptr) {
+      const float rem_dx = live_target->x - x_cm;
+      const float rem_dy = live_target->y - y_cm;
+      const float radius = hypotf(rem_dx, rem_dy);
+      check_dist = radius;
+
+      if (radius <= DISTANCE_TOLERANCE_CM) {
+        setMotors(0, 0);
+        if (isChassisStationary(0)) {
+          if (settled_since_ms == 0) settled_since_ms = now_ms;
+          if (static_cast<uint32_t>(now_ms - settled_since_ms) >= PRIMARY_SETTLE_MS) return true;
+        } else {
+          settled_since_ms = 0;
+        }
+        delay(CONTROL_PERIOD_MS);
+        continue;
+      }
+
+      const float along = rem_dx * cosf(segment_heading) + rem_dy * sinf(segment_heading);
+      const float cross = -rem_dx * sinf(segment_heading) + rem_dy * cosf(segment_heading);
+
+      // If perpendicular line is reached: settle if within acceptable radius & stationary, else realign
+      if (fabsf(along) <= DISTANCE_TOLERANCE_CM) {
+        if (radius <= DISTANCE_ACCEPTABLE_CM) {
+          setMotors(0, 0);
+          if (isChassisStationary(0)) {
+            if (settled_since_ms == 0) settled_since_ms = now_ms;
+            if (static_cast<uint32_t>(now_ms - settled_since_ms) >= PRIMARY_SETTLE_MS) return true;
+          } else {
+            settled_since_ms = 0;
+          }
+          delay(CONTROL_PERIOD_MS);
+          continue;
+        } else if (realign_count < 2) {
+          realign_count++;
+          setMotors(0, 0);
+          segment_heading = atan2f(rem_dy, rem_dx);
+          if (!turnToHeading(segment_heading)) return false;
+          previous_time_us = micros() - (CONTROL_PERIOD_MS * 1000UL);
+          settled_since_ms = 0;
+          stall_since_ms = 0;
+          integral = 0.0f;
+          continue;
+        }
+      }
+
+      const float direction = (along >= 0.0f) ? 1.0f : -1.0f;
+      const float lookahead_corr = constrain(
+          atan2f(direction * cross, fmaxf(fabsf(along), LOOKAHEAD_CM)),
+          -0.45f, 0.45f);
+      heading_error = normalizeAngle(segment_heading + lookahead_corr - theta_rad);
+      error = along;
+
+      // If knocked >45 deg off-course while >8cm from waypoint, stop & realign cleanly
+      if (fabsf(heading_error) > 0.8f && radius > 8.0f && realign_count < 2) {
+        realign_count++;
+        setMotors(0, 0);
+        segment_heading = atan2f(rem_dy, rem_dx);
+        if (!turnToHeading(segment_heading)) return false;
+        previous_time_us = micros() - (CONTROL_PERIOD_MS * 1000UL);
+        settled_since_ms = 0;
+        stall_since_ms = 0;
+        integral = 0.0f;
+        continue;
+      }
+    }
+    
+    // 1. Primary tight settle check (0.8 cm AND stationary throughout 150ms window)
+    if (fabsf(error) <= DISTANCE_TOLERANCE_CM && check_dist <= DISTANCE_ACCEPTABLE_CM) {
+      setMotors(0, 0);
+      if (isChassisStationary(0)) {
+        if (settled_since_ms == 0) settled_since_ms = now_ms;
+        if (static_cast<uint32_t>(now_ms - settled_since_ms) >= PRIMARY_SETTLE_MS) return true;
+      } else {
+        settled_since_ms = 0;
+      }
+      delay(CONTROL_PERIOD_MS);
+      continue;
+    }
+    settled_since_ms = 0;
+
+    // 2. Practical stall-settle check (within 2.8 cm AND stationary throughout 600ms window)
+    if (check_dist <= DISTANCE_ACCEPTABLE_CM && isChassisStationary(0)) {
+      if (fabsf(check_dist - stall_anchor_dist) > 0.15f) {
+        stall_anchor_dist = check_dist;
+        stall_since_ms = now_ms;
+      } else if (stall_since_ms == 0) {
+        stall_since_ms = now_ms;
+      } else if (static_cast<uint32_t>(now_ms - stall_since_ms) >= STALL_SETTLE_MS) {
+        setMotors(0, 0);
+        return true;
+      }
+    } else {
+      stall_since_ms = 0;
+      stall_anchor_dist = check_dist;
+    }
+
+    // Zero-crossing anti-windup reset
+    if ((error > 0.0f && previous_error < 0.0f) || (error < 0.0f && previous_error > 0.0f)) {
+      integral = 0.0f;
+    }
+    previous_error = error;
+
+    integral = constrain(integral + error * dt_s, -100.0f, 100.0f);
+    float forward_power = Kp_dist * error + Ki_dist * integral + Kd_dist * derivative;
+    forward_power = applyDeadbandWithDirection(forward_power, error, min_drive_pwm);
+
+    // Apply cosine scaling AFTER friction deadband whenever pushing toward error
+    if (forward_power * error > 0.0f) {
+      forward_power *= fmaxf(0.0f, cosf(heading_error));
+    }
+
+    // Soft-start ramp bounded by active_max so configured PWM ceiling is never exceeded
+    const uint32_t elapsed_ms = static_cast<uint32_t>(now_ms - start_time_ms);
+    const float active_max = fminf(255.0f, max_drive_pwm);
+    const float ramp_start = fminf(80.0f, active_max);
+    const float ramp_limit = (elapsed_ms < RAMP_UP_MS)
+        ? (ramp_start + ((active_max - ramp_start) * static_cast<float>(elapsed_ms)) / static_cast<float>(RAMP_UP_MS))
+        : active_max;
+    forward_power = constrain(forward_power, -ramp_limit, ramp_limit);
+
+    // Full PD heading correction during straight drive
+    const float correction_power = Kp_turn * heading_error - Kd_turn * latest_turn_rate_rad_s;
+
+    float left_pwm = forward_power - correction_power;
+    float right_pwm = forward_power + correction_power;
+    limitMotorPair(left_pwm, right_pwm, ramp_limit);
+
+    // 3. Hardware burnout protection if physically jammed for > 2.5s
+    if (fmaxf(fabsf(left_pwm), fabsf(right_pwm)) > 80.0f && isChassisStationary(40)) {
+      if (hard_stall_since_ms == 0) hard_stall_since_ms = now_ms;
+      else if (static_cast<uint32_t>(now_ms - hard_stall_since_ms) >= HARD_STALL_PROTECT_MS) {
+        setMotors(0, 0);
+        if (check_dist <= 4.5f) return true; // Safely inside the 10cm circle (5cm radius): accept & dwell
+        Serial.println("\n[STALL PROTECTION]: Chassis jammed during drive. Pausing to protect motors.");
+        if (mission_started && !mission_done) enterRecoveryPause();
+        return false;
+      }
+    } else {
+      hard_stall_since_ms = 0;
+    }
+
+    setMotors(left_pwm, right_pwm);
+    delay(CONTROL_PERIOD_MS);
+  }
+
+  setMotors(0, 0);
+  Serial.println("\n[TIMEOUT FAULT]: Drive failed to reach target distance within 30s.");
+  if (mission_started && !mission_done) enterRecoveryPause();
+  return false;
+}
+
+// ==========================================
+// 9. SERIAL & BUTTON INPUT HANDLING
+// ==========================================
+bool parseCommandFloat(const char *text, float &value) {
+  if (text == nullptr || *text == '\0') return false;
+  char *end = nullptr;
+  value = strtof(text, &end);
+  if (end == text || !isfinite(value)) return false;
+  while (*end != '\0' && isspace(static_cast<unsigned char>(*end))) ++end;
+  return *end == '\0';
+}
+
+bool parseCommandInt(const char *text, int &value, int min_val, int max_val) {
+  if (text == nullptr || *text == '\0') return false;
+  char *end = nullptr;
+  const long parsed = strtol(text, &end, 10);
+  if (end == text) return false;
+  while (*end != '\0' && isspace(static_cast<unsigned char>(*end))) ++end;
+  if (*end != '\0' || parsed < min_val || parsed > max_val) return false;
+  value = static_cast<int>(parsed);
+  return true;
+}
+
+bool matchCommandPrefix(const char *cmd, const char *prefix, char *&args_out) {
+  const size_t len = strlen(prefix);
+  if (strncmp(cmd, prefix, len) != 0) return false;
+  if (cmd[len] == '\0') {
+    args_out = const_cast<char *>(cmd + len);
+    return true;
+  }
+  if (isspace(static_cast<unsigned char>(cmd[len]))) {
+    char *p = const_cast<char *>(cmd + len);
+    while (*p != '\0' && isspace(static_cast<unsigned char>(*p))) ++p;
+    args_out = p;
+    return true;
+  }
+  return false;
+}
+
+void handleSerialCommand(char *command) {
+  while (*command != '\0' && isspace(static_cast<unsigned char>(*command))) ++command;
+  char *end = command + strlen(command);
+  while (end > command && isspace(static_cast<unsigned char>(end[-1]))) *--end = '\0';
+  for (char *p = command; *p != '\0'; ++p) {
+    *p = static_cast<char>(tolower(static_cast<unsigned char>(*p)));
+  }
+
+  if (command[0] == '\0') return;
+
+  if (strcmp(command, "help") == 0 || strcmp(command, "?") == 0) {
+    printHelp();
+    return;
+  }
+
+  if (strcmp(command, "s") == 0 || strcmp(command, "run") == 0 || strcmp(command, "start") == 0) {
+    if (paused_for_recovery) {
+      resumeFromRecovery();
+    } else {
+      triggerMissionStart();
+    }
+    return;
+  }
+
+  if (strcmp(command, "x") == 0 || strcmp(command, "stop") == 0 || strcmp(command, "pause") == 0) {
+    if (mission_started && !paused_for_recovery) {
+      enterRecoveryPause();
+    } else {
+      setMotors(0, 0);
+      abort_current_motion = true;
+      Serial.println("\n[MOTORS STOPPED]");
+    }
+    return;
+  }
+
+  if (strcmp(command, "status") == 0) {
+    printStatusReport();
+    return;
+  }
+
+  if (strcmp(command, "zero") == 0) {
+    if (mission_started && !mission_done && !paused_for_recovery) {
+      Serial.println("\n[COMMAND ERROR]: Pause/stop the active mission before zeroing pose.");
+      return;
+    }
+    setMotors(0, 0);
+    x_cm = 0.0f;
+    y_cm = 0.0f;
+    theta_rad = 0.0f;
+    syncOdometryTrackers(true);
+    Serial.println("\n[POSE ZEROED]: (0, 0, 0 deg).");
+    return;
+  }
+
+  if (strcmp(command, "cal") == 0 || strcmp(command, "prep") == 0) {
+    if (mission_started && !mission_done && !paused_for_recovery) {
+      Serial.println("\n[COMMAND ERROR]: Stop the active mission before calibrating.");
+      return;
+    }
+    setMotors(0, 0);
+    const bool cal_ok = calibrateGyro();
+    syncOdometryTrackers(false);
+    if (!cal_ok) {
+      Serial.println("[COMMAND ERROR]: Gyro calibration failed. Ensure robot is stationary and retry 'cal'.");
+    }
+    return;
+  }
+
+  if (strcmp(command, "plan") == 0) {
+    calculateOptimalRoute();
+    return;
+  }
+
+  char *args = nullptr;
+
+  // Bounded RAM PID Tuning: "gaind <kp> <ki> <kd>" or "gainh <kp> <ki> <kd>"
+  if (matchCommandPrefix(command, "gaind", args) || matchCommandPrefix(command, "gainh", args)) {
+    const bool is_dist_gain = (command[4] == 'd');
+    char *save_ptr = nullptr;
+    char *tok_p = strtok_r(args, " \t", &save_ptr);
+    char *tok_i = strtok_r(nullptr, " \t", &save_ptr);
+    char *tok_d = strtok_r(nullptr, " \t", &save_ptr);
+    char *tok_extra = strtok_r(nullptr, " \t", &save_ptr);
+    float kp, ki, kd;
+    if (!tok_p || !tok_i || !tok_d || tok_extra ||
+        !parseCommandFloat(tok_p, kp) ||
+        !parseCommandFloat(tok_i, ki) ||
+        !parseCommandFloat(tok_d, kd)) {
+      Serial.println("\n[COMMAND ERROR]: Usage: gaind <kp> <ki> <kd> OR gainh <kp> <ki> <kd>");
+      return;
+    }
+    if (kp < 0.0f || kp > MAX_PID_GAIN || ki < 0.0f || ki > MAX_PID_GAIN || kd < 0.0f || kd > MAX_PID_GAIN) {
+      Serial.println("\n[COMMAND ERROR]: PID gains rejected. Each gain must be between 0.0 and 500.0.");
+      return;
+    }
+    if (is_dist_gain) { Kp_dist = kp; Ki_dist = ki; Kd_dist = kd; }
+    else              { Kp_turn = kp; Ki_turn = ki; Kd_turn = kd; }
+    printStatusReport();
+    return;
+  }
+
+  // Validated RAM PWM Limit Tuning: "pwm <drive_max> <turn_max>" or "minpwm <drive_min> <turn_min>"
+  if (matchCommandPrefix(command, "pwm", args) || matchCommandPrefix(command, "minpwm", args)) {
+    const bool is_min = (command[0] == 'm');
+    char *save_ptr = nullptr;
+    char *tok_d = strtok_r(args, " \t", &save_ptr);
+    char *tok_t = strtok_r(nullptr, " \t", &save_ptr);
+    char *tok_extra = strtok_r(nullptr, " \t", &save_ptr);
+    float d_val, t_val;
+    if (!tok_d || !tok_t || tok_extra || !parseCommandFloat(tok_d, d_val) || !parseCommandFloat(tok_t, t_val)) {
+      Serial.println(is_min
+          ? "\n[COMMAND ERROR]: Usage: minpwm <drive_min> <turn_min>"
+          : "\n[COMMAND ERROR]: Usage: pwm <drive_max> <turn_max>");
+      return;
+    }
+    if (is_min) {
+      if (d_val < 0.0f || d_val > max_drive_pwm || t_val < 0.0f || t_val > max_turn_pwm || d_val > 150.0f || t_val > 150.0f) {
+        Serial.println("\n[COMMAND ERROR]: minpwm rejected. Values must be in [0, 150] and <= current max PWM.");
+        return;
+      }
+      min_drive_pwm = d_val;
+      min_turn_pwm  = t_val;
+    } else {
+      if (d_val < 50.0f || d_val > 255.0f || t_val < 50.0f || t_val > 255.0f || d_val < min_drive_pwm || t_val < min_turn_pwm) {
+        Serial.println("\n[COMMAND ERROR]: pwm rejected. Values must be in [50, 255] and >= current minpwm.");
+        return;
+      }
+      max_drive_pwm = d_val;
+      max_turn_pwm  = t_val;
+    }
+    printStatusReport();
+    return;
+  }
+
+  // Validated RAM Wheel Trim Tuning: "trim <left_mult> <right_mult>"
+  if (matchCommandPrefix(command, "trim", args)) {
+    char *save_ptr = nullptr;
+    char *tok_l = strtok_r(args, " \t", &save_ptr);
+    char *tok_r = strtok_r(nullptr, " \t", &save_ptr);
+    char *tok_extra = strtok_r(nullptr, " \t", &save_ptr);
+    float l_val, r_val;
+    if (!tok_l || !tok_r || tok_extra || !parseCommandFloat(tok_l, l_val) || !parseCommandFloat(tok_r, r_val)) {
+      Serial.println("\n[COMMAND ERROR]: Usage: trim <left_mult> <right_mult>");
+      return;
+    }
+    if (l_val < 0.5f || l_val > 1.5f || r_val < 0.5f || r_val > 1.5f) {
+      Serial.println("\n[COMMAND ERROR]: trim rejected. Multipliers must be between 0.5 and 1.5.");
+      return;
+    }
+    motor_l_trim = l_val;
+    motor_r_trim = r_val;
+    printStatusReport();
+    return;
+  }
+
+  // Transactional, integer-checked, range-validated waypoint update: "wp <1..5> <x_cm> <y_cm>"
+  if (matchCommandPrefix(command, "wp", args)) {
+    if (mission_started && !mission_done && !paused_for_recovery) {
+      Serial.println("\n[COMMAND ERROR]: Stop the active mission before editing waypoints.");
+      return;
+    }
+    char *save_ptr = nullptr;
+    char *tok_id = strtok_r(args, " \t", &save_ptr);
+    char *tok_x  = strtok_r(nullptr, " \t", &save_ptr);
+    char *tok_y  = strtok_r(nullptr, " \t", &save_ptr);
+    char *tok_extra = strtok_r(nullptr, " \t", &save_ptr);
+    int wp_id = 0;
+    float wx = 0.0f, wy = 0.0f;
+    if (!tok_id || !tok_x || !tok_y || tok_extra ||
+        !parseCommandInt(tok_id, wp_id, 1, 5) ||
+        !parseCommandFloat(tok_x, wx) ||
+        !parseCommandFloat(tok_y, wy)) {
+      Serial.println("\n[COMMAND ERROR]: Usage: wp <1..5> <x_cm> <y_cm> (ID must be integer 1..5).");
+      return;
+    }
+    if (wx < MIN_COORD_CM || wx > MAX_COORD_CM || wy < MIN_COORD_CM || wy > MAX_COORD_CM) {
+      Serial.println("\n[COMMAND ERROR]: Waypoint coordinates out of bounds (expected [-300, 300] cm).");
+      return;
+    }
+    const int idx = wp_id - 1;
+    const Point previous_wp = waypoints[idx];
+    waypoints[idx] = {wx, wy};
+    if (!calculateOptimalRoute()) {
+      waypoints[idx] = previous_wp; // Transactional rollback on route failure
+      Serial.println("\n[COMMAND ERROR]: Route calculation failed; waypoint change rolled back.");
+      return;
+    }
+    Serial.print("\n[WAYPOINT COMMITTED]: P");
+    Serial.print(wp_id);
+    Serial.print(" = (");
+    Serial.print(wx, 1);
+    Serial.print(", ");
+    Serial.print(wy, 1);
+    Serial.println(")");
+    return;
+  }
+
+  // Recovery command: "r [leg 1..6] [heading_deg]" or "resume"
+  if (matchCommandPrefix(command, "r", args) || strcmp(command, "resume") == 0) {
+    int override_step = -1;
+    float custom_heading_deg = NAN;
+    if (args != nullptr && *args != '\0') {
+      char *save_ptr = nullptr;
+      char *tok_step = strtok_r(args, " \t", &save_ptr);
+      char *tok_hdg  = strtok_r(nullptr, " \t", &save_ptr);
+      char *tok_extra = strtok_r(nullptr, " \t", &save_ptr);
+      int step_int = 0;
+      if (tok_extra != nullptr || !parseCommandInt(tok_step, step_int, 1, 6)) {
+        Serial.println("\n[COMMAND ERROR]: Usage: r [leg 1..6] [heading_deg -360..360]");
+        return;
+      }
+      override_step = step_int - 1;
+      if (tok_hdg != nullptr) {
+        float parsed_hdg = 0.0f;
+        if (!parseCommandFloat(tok_hdg, parsed_hdg) || fabsf(parsed_hdg) > 360.0f) {
+          Serial.println("\n[COMMAND ERROR]: Invalid recovery heading (expected finite degrees in [-360, 360]).");
+          return;
+        }
+        custom_heading_deg = parsed_hdg;
+      } else if (paused_for_recovery) {
+        // If user explicitly specifies a new leg while paused without a heading token, default that leg's heading to 0 deg
+        custom_heading_deg = 0.0f;
+      }
+    }
+
+    if (!mission_started) {
+      Serial.println("\n[COMMAND IGNORED]: Mission has not started yet.");
+      return;
+    }
+    if (!paused_for_recovery) {
+      enterRecoveryPause(override_step, isfinite(custom_heading_deg) ? custom_heading_deg : 0.0f);
+    } else {
+      resumeFromRecovery(override_step, custom_heading_deg);
+    }
+    return;
+  }
+
+  // Standalone PID test commands: "turn <deg>", "rotate <deg>", "drive <cm>"
+  const bool is_turn = matchCommandPrefix(command, "turn", args);
+  const bool is_rotate = !is_turn && matchCommandPrefix(command, "rotate", args);
+  const bool is_drive = !is_turn && !is_rotate && matchCommandPrefix(command, "drive", args);
+  if (is_turn || is_rotate || is_drive) {
+    float value = 0.0f;
+    if (!parseCommandFloat(args, value) || ((is_turn || is_rotate) && fabsf(value) > 360.0f) || (is_drive && fabsf(value) > 400.0f)) {
+      Serial.println("\n[COMMAND ERROR]: Expected a single valid numeric value (angle in [-360, 360] or distance in [-400, 400] cm).");
+      return;
+    }
+    if (mission_started && !mission_done && !paused_for_recovery) {
+      Serial.println("\n[COMMAND ERROR]: Pause/stop the active mission before a PID test.");
+      return;
+    }
+
+    abort_current_motion = false;
+    if (!is_rotate) {
+      x_cm = 0.0f;
+      y_cm = 0.0f;
+      theta_rad = 0.0f;
+    }
+    syncOdometryTrackers(false);
+
+    const float target_rad = is_rotate
+        ? normalizeAngle(theta_rad + value * DEG_TO_RAD)
+        : (value * DEG_TO_RAD);
+    const bool succeeded = (is_turn || is_rotate)
+        ? turnToHeading(target_rad)
+        : driveDistance(value, theta_rad, nullptr);
+    setMotors(0, 0);
+    abort_current_motion = false;
+    Serial.println(succeeded ? "\n[PID TEST COMPLETE]" : "\n[PID TEST FAILED OR STOPPED]");
+    return;
+  }
+
+  Serial.println("\n[COMMAND ERROR]: Unknown command. Type 'help' for available commands.");
+}
+
+// Unified input monitor for both Serial text and the physical BOOT button
+bool checkUserInput() {
+  static uint32_t last_press_ms = 0;
+  const bool curr_btn = digitalRead(BTN_PIN);
+  
+  if (curr_btn == LOW && last_btn_state == HIGH && static_cast<uint32_t>(millis() - last_press_ms) > 300) {
+    last_press_ms = millis();
+    last_btn_state = LOW;
+
+    if (!mission_started) {
+      triggerMissionStart();
+    } else if (!paused_for_recovery) {
+      enterRecoveryPause();
+    } else {
+      // Paused -> Short tap (<0.8s) starts 5s recovery countdown; Hold (>=0.8s) cycles recovery leg
+      const uint32_t hold_start_ms = millis();
+      bool cycled_selection = false;
+      while (digitalRead(BTN_PIN) == LOW) {
+        if (static_cast<uint32_t>(millis() - hold_start_ms) >= 800) {
+          cycled_selection = true;
+          const int max_leg = constrain(current_target_index, 0, 5);
+          recovery_target_index = (recovery_target_index > 0) ? (recovery_target_index - 1) : max_leg;
+          recovery_blink_start_ms = millis();
+          Serial.print("\n[BUTTON SELECTION]: Cycled recovery target to Route Leg ");
+          Serial.print(recovery_target_index + 1);
+          if (recovery_target_index < 5) {
+            Serial.print(" (Waypoint P");
+            Serial.print(optimal_route[recovery_target_index] + 1);
+            Serial.println(")");
+          } else {
+            Serial.println(" (HOME)");
+          }
+          for (int k = 0; k < 2; ++k) {
+            digitalWrite(LED_PIN, HIGH); delay(80);
+            digitalWrite(LED_PIN, LOW);  delay(80);
+          }
+          while (digitalRead(BTN_PIN) == LOW) delay(10);
+          break;
+        }
+        delay(10);
+      }
+      if (!cycled_selection) {
+        resumeFromRecovery();
+      }
+    }
+    last_btn_state = digitalRead(BTN_PIN);
+    return abort_current_motion;
+  }
+  last_btn_state = curr_btn;
+
+  while (Serial.available() > 0) {
+    const char input = static_cast<char>(Serial.read());
+    if ((input == 'x' || input == 'X') && serial_command_length == 0) {
+      if (mission_started && !paused_for_recovery) {
+        enterRecoveryPause();
+      } else {
+        setMotors(0, 0);
+        abort_current_motion = true;
+      }
+      serial_command_length = 0;
+      serial_command_overflow = false;
+      return abort_current_motion;
+    }
+    if (input == '\r') continue;
+    if (input == '\n') {
+      if (!serial_command_overflow) {
+        serial_command[serial_command_length] = '\0';
+        handleSerialCommand(serial_command);
+      } else {
+        Serial.println("\n[COMMAND ERROR]: Input line is too long.");
+      }
+      serial_command_length = 0;
+      serial_command_overflow = false;
+      if (abort_current_motion) break;
+    } else if (!serial_command_overflow) {
+      if (serial_command_length + 1 < sizeof(serial_command)) {
+        serial_command[serial_command_length++] = input;
+      } else {
+        serial_command_overflow = true;
+      }
+    }
+  }
+  return abort_current_motion;
+}
+
+// ==========================================
+// 10. SETUP & MAIN MISSION CONTROL LOOP
+// ==========================================
+void setup() {
+  Serial.begin(115200);
+  
+  pinMode(BTN_PIN, INPUT_PULLUP);
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+  
+  setupMotors();
+  
+  pinMode(ENC_L_A, INPUT_PULLUP); pinMode(ENC_L_B, INPUT_PULLUP);
+  pinMode(ENC_R_A, INPUT_PULLUP); pinMode(ENC_R_B, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(ENC_L_A), isr_left, RISING);
+  attachInterrupt(digitalPinToInterrupt(ENC_R_A), isr_right, RISING);
+
+  while (!setupIMU()) {
+    Serial.println("[INIT ERROR]: Failed to initialize MPU-6050. Check SDA(21)/SCL(22) wiring...");
+    digitalWrite(LED_PIN, HIGH); delay(100);
+    digitalWrite(LED_PIN, LOW);  delay(900);
+  }
+  while (!calibrateGyro()) {
+    Serial.println("[INIT ERROR]: Gyro calibration failed. Place robot on a flat, still surface...");
+    delay(500);
+  }
+  
+  if (!calculateOptimalRoute()) {
+    setMotors(0, 0);
+    while (true) delay(1000);
+  }
+  syncOdometryTrackers(true);
+  last_btn_state = digitalRead(BTN_PIN);
+  Serial.println("READY: Place robot at Origin (0,0) facing +X and press BOOT button (or send 's').");
+}
+
+void loop() {
+  checkUserInput();
+  updateOdometry();
+  printTelemetry();
+
+  if (!mission_started || mission_done || paused_for_recovery) {
+    setMotors(0, 0);
+    if (paused_for_recovery) {
+      // Diagnostic LED pulse pattern: blinks waypoint ID (1..5, or 6 for Home)
+      const uint32_t pulses = (recovery_target_index < 5)
+          ? static_cast<uint32_t>(optimal_route[recovery_target_index] + 1)
+          : 6UL;
+      const uint32_t phase = static_cast<uint32_t>(millis() - recovery_blink_start_ms) % (pulses * 400UL + 1600UL);
+      digitalWrite(LED_PIN, (phase < pulses * 400UL && (phase % 400UL) < 180UL) ? HIGH : LOW);
+    }
+    delay(CONTROL_PERIOD_MS);
+    return;
+  }
+
+  abort_current_motion = false;
+  Point target;
+  if (current_target_index < 5) {
+    target = waypoints[optimal_route[current_target_index]];
+    Serial.print("\n--- Heading to Waypoint "); 
+    Serial.print(current_target_index + 1); 
+    Serial.print("/5 (P");
+    Serial.print(optimal_route[current_target_index] + 1);
+    Serial.println(") ---");
+  } else {
+    target = {0.0f, 0.0f}; 
+    Serial.println("\n--- Returning HOME ---");
+  }
+
+  float dx = target.x - x_cm;
+  float dy = target.y - y_cm;
+  
+  if (hypotf(dx, dy) > DISTANCE_TOLERANCE_CM) {
+    Serial.println("1. Turning to face target...");
+    if (!turnToHeading(atan2f(dy, dx))) {
+      setMotors(0, 0);
+      return; // Paused for recovery or stopped by user
+    }
+  }
+
+  dx = target.x - x_cm;
+  dy = target.y - y_cm;
+  const float target_distance = hypotf(dx, dy);
+  const float exact_target_heading = atan2f(dy, dx);
+  
+  Serial.println("2. Driving straight to target...");
+  if (!driveDistance(target_distance, exact_target_heading, &target)) {
+    setMotors(0, 0);
+    return; // Paused for recovery or stopped by user
+  }
+
+  // Wait up to 400ms for physical coasting to stop completely before starting the 2.5s judge dwell clock
+  setMotors(0, 0);
+  const uint32_t brake_wait_start = millis();
+  while (!isChassisStationary(STILL_HOLD_MS) && static_cast<uint32_t>(millis() - brake_wait_start) < 400) {
+    if (checkUserInput()) { setMotors(0, 0); return; }
+    updateOdometry();
+    delay(CONTROL_PERIOD_MS);
+  }
+
+  // Post-coasting Dwell Guard: if robot coasted >3.2cm past target, perform one precision trim
+  const float post_coast_dx = target.x - x_cm;
+  const float post_coast_dy = target.y - y_cm;
+  const float post_coast_dist = hypotf(post_coast_dx, post_coast_dy);
+  if (post_coast_dist > 3.2f) {
+    if (!driveDistance(post_coast_dist, atan2f(post_coast_dy, post_coast_dx), &target)) {
+      setMotors(0, 0);
+      return;
+    }
+    setMotors(0, 0);
+  }
+
+  Serial.println("3. Target Reached & Stationary! Dwelling for 2.5s...");
+  in_dwell_phase = true;
+  digitalWrite(LED_PIN, HIGH); // Visual stop indicator for judges
+  
+  const uint32_t dwell_start = millis();
+  while (static_cast<uint32_t>(millis() - dwell_start) < 2500) {
+    if (checkUserInput()) {
+      setMotors(0, 0);
+      digitalWrite(LED_PIN, LOW);
+      in_dwell_phase = false;
+      return; // Paused for recovery or stopped by user
+    }
+    
+    updateOdometry();
+    printTelemetry();
+    delay(CONTROL_PERIOD_MS);
+  }
+  
+  digitalWrite(LED_PIN, LOW);
+  in_dwell_phase = false;
+
+  // Record completed dwell state so post-dwell recovery within 8s/25cm still snaps to THIS waypoint
+  last_dwelled_index = current_target_index;
+  last_dwell_end_ms = millis();
+  last_dwell_pos = {x_cm, y_cm};
+
+  current_target_index++;
+  
+  if (current_target_index > 5) {
+    mission_done = true;
+    setMotors(0, 0);
+    Serial.println("\n[MISSION COMPLETE]: All targets and Home base secured!");
+  }
+}
